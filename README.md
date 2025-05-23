@@ -35,7 +35,7 @@ Profite d'une interface intuitive, d’une gestion avancée de la file d’atten
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/Kylianbelon/BlocKariaMusic.git
+git clone https://github.com/RillMaster/BlocKariaMusic.git
 cd BotMusicDiscord
 pip install -r requirements.txt
 Crée un fichier .env à la racine du projet avec ton token Discord :

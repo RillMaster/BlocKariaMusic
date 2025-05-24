@@ -5,7 +5,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
 from collections import deque
-from discord.ui import View
+from discord.ui import View, Button
 import asyncio
 from datetime import timedelta
 import sys
@@ -65,6 +65,14 @@ async def recherche_ytdlp_async(requete, options_ydl):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _extraire(requete, options_ydl))
 
+async def refresh_controls(client_vocal, id_guild, canal):
+    # On crée une nouvelle vue à jour
+    view = PlayerControls(client_vocal, id_guild, canal)
+    message = EMBED_MESSAGES.get(id_guild)
+    if isinstance(message, discord.Message):
+        await message.edit(view=view)
+
+
 async def jouer_prochaine_chanson(client_vocal, id_guild, canal):
     id_guild = str(id_guild)
     # --- Correction : attendre un peu avant de déconnecter si la file est vide ---
@@ -81,10 +89,17 @@ async def jouer_prochaine_chanson(client_vocal, id_guild, canal):
             EN_COURS_TYPE[id_guild] = None
         return
 
+    # --- SHUFFLE ---
+    if LOOP_QUEUE.get(id_guild):
+        # Mélange la file sauf la première
+        if len(FILES_ATTENTE[id_guild]) > 1:
+            morceaux = list(FILES_ATTENTE[id_guild])
+            random.shuffle(morceaux)
+            FILES_ATTENTE[id_guild] = deque(morceaux)
+
     url_audio, titre, miniature, duree = FILES_ATTENTE[id_guild].popleft()
     EN_COURS[id_guild] = (url_audio, titre, miniature, duree)
     EN_COURS_TYPE[id_guild] = "music"
-
     options_ffmpeg = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         "options": "-vn"
@@ -128,32 +143,62 @@ class PlayerControls(View):
         self.id_guild = id_guild
         self.canal = canal
 
-    @discord.ui.button(label="⏸️ Pause", style=discord.ButtonStyle.secondary)
-    async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.client_vocal.is_playing():
-            self.client_vocal.pause()
-            await interaction.response.send_message("⏸️ Pause.", ephemeral=True)
+        # Pause/Reprendre
+        if self.client_vocal.is_paused():
+            label = "▶️ Reprendre"
+            style = discord.ButtonStyle.success
         else:
-            await interaction.response.send_message("❌ Rien à mettre en pause.", ephemeral=True)
+            label = "⏸️ Pause"
+            style = discord.ButtonStyle.secondary
+        self.pause_resume_button = Button(label=label, style=style, custom_id="pause_resume_button")
+        self.pause_resume_button.callback = self.pause_resume
+        self.add_item(self.pause_resume_button)
 
-    @discord.ui.button(label="▶️ Reprendre", style=discord.ButtonStyle.secondary)
-    async def resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Skip
+        self.skip_button = Button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, custom_id="skip_button")
+        self.skip_button.callback = self.skip
+        self.add_item(self.skip_button)
+
+        # Stop
+        self.stop_button = Button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="stop_button")
+        self.stop_button.callback = self.stop
+        self.add_item(self.stop_button)
+
+        # Bouton de répétition (cycle entre désactivé, chanson, file)
+        loop_song = LOOP_SONG.get(self.id_guild, False)
+        loop_queue = LOOP_QUEUE.get(self.id_guild, False)
+        if loop_song:
+            label = "🔁 Répéter la chanson"
+            style = discord.ButtonStyle.success
+        elif loop_queue:
+            label = "🔂 Répéter la file"
+            style = discord.ButtonStyle.success
+        else:
+            label = "🔁 Répétition désactivée"
+            style = discord.ButtonStyle.secondary
+        self.repeat_button = Button(label=label, style=style, custom_id="repeat_button")
+        self.repeat_button.callback = self.toggle_repeat
+        self.add_item(self.repeat_button)
+
+    async def pause_resume(self, interaction):
         if self.client_vocal.is_paused():
             self.client_vocal.resume()
             await interaction.response.send_message("▶️ Reprise.", ephemeral=True)
+        elif self.client_vocal.is_playing():
+            self.client_vocal.pause()
+            await interaction.response.send_message("⏸️ Pause.", ephemeral=True)
         else:
-            await interaction.response.send_message("❌ Aucune musique en pause.", ephemeral=True)
+            await interaction.response.send_message("❌ Rien à mettre en pause ou reprendre.", ephemeral=True)
+        await self.update_buttons(interaction)
 
-    @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.secondary)
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def skip(self, interaction):
         if self.client_vocal.is_playing():
             self.client_vocal.stop()
             await interaction.response.send_message("⏭️ Passé à la suivante.", ephemeral=True)
         else:
             await interaction.response.send_message("❌ Aucune chanson à passer.", ephemeral=True)
 
-    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger)
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def stop(self, interaction):
         if self.client_vocal.is_connected():
             await interaction.response.send_message("⏹️ Lecture arrêtée et déconnexion.", ephemeral=True)
             self.client_vocal.stop()
@@ -164,9 +209,63 @@ class PlayerControls(View):
         else:
             await interaction.response.send_message("❌ Non connecté à un salon vocal.", ephemeral=True)
 
-@bot.tree.command(name="radio", description="Joue une radio en direct")
+    async def toggle_repeat(self, interaction):
+        # Cycle : désactivé -> chanson -> file -> désactivé ...
+        loop_song = LOOP_SONG.get(self.id_guild, False)
+        loop_queue = LOOP_QUEUE.get(self.id_guild, False)
+        if not loop_song and not loop_queue:
+            LOOP_SONG[self.id_guild] = True
+            LOOP_QUEUE[self.id_guild] = False
+            msg = "🔁 Répétition de la **chanson** activée."
+        elif loop_song:
+            LOOP_SONG[self.id_guild] = False
+            LOOP_QUEUE[self.id_guild] = True
+            msg = "🔂 Répétition de la **file d'attente** activée."
+        else:
+            LOOP_SONG[self.id_guild] = False
+            LOOP_QUEUE[self.id_guild] = False
+            msg = "⏹️ Répétition désactivée."
+        await self.update_buttons(interaction, msg)
+
+    async def update_buttons(self, interaction, msg="✅ Contrôles mis à jour."):
+        # Pause/Reprendre
+        if self.client_vocal.is_paused():
+            self.pause_resume_button.label = "▶️ Reprendre"
+            self.pause_resume_button.style = discord.ButtonStyle.success
+        else:
+            self.pause_resume_button.label = "⏸️ Pause"
+            self.pause_resume_button.style = discord.ButtonStyle.secondary
+
+        # Répétition (un seul bouton)
+        loop_song = LOOP_SONG.get(self.id_guild, False)
+        loop_queue = LOOP_QUEUE.get(self.id_guild, False)
+        if loop_song:
+            self.repeat_button.label = "🔁 Répéter la chanson"
+            self.repeat_button.style = discord.ButtonStyle.success
+        elif loop_queue:
+            self.repeat_button.label = "🔂 Répéter la file"
+            self.repeat_button.style = discord.ButtonStyle.success
+        else:
+            self.repeat_button.label = "🔁 Répétition désactivée"
+            self.repeat_button.style = discord.ButtonStyle.secondary
+
+        # Met à jour la vue sur le message de contrôle
+        message = EMBED_MESSAGES.get(self.id_guild)
+        if isinstance(message, discord.Message):
+            await message.edit(view=self)
+
+        # Message de confirmation (éphémère)
+        try:
+            await interaction.response.send_message(msg, ephemeral=True)
+        except discord.InteractionResponded:
+            pass
+
+@bot.tree.command(
+    name="radio",
+    description="🎶📻 Joue une radio en direct dans ton salon vocal !"
+)
 @app_commands.describe(
-    choix_radio="Choisis la radio à écouter"
+    choix_radio="🎧 Choisis la radio à écouter"
 )
 @app_commands.choices(
     choix_radio=[
@@ -174,45 +273,71 @@ class PlayerControls(View):
         for cle, (nom, url) in RADIOS.items()
     ]
 )
-async def radio(interaction: discord.Interaction, choix_radio: app_commands.Choice[str]):
+async def radio(
+    interaction: discord.Interaction, 
+    choix_radio: app_commands.Choice[str]
+):
     radio_key = choix_radio.value
     radio_name, radio_url = RADIOS[radio_key]
     id_guild = str(interaction.guild.id)
 
-    if interaction.user.voice is None:
-        await interaction.response.send_message("❌ Tu dois être dans un salon vocal.", ephemeral=True)
+    # Vérification de la présence dans un salon vocal
+    if not interaction.user.voice:
+        await interaction.response.send_message(
+            "❌ Tu dois être connecté à un salon vocal pour écouter une radio ! 🎤",
+            ephemeral=True
+        )
         return
 
-    await interaction.response.send_message(f"📻 Connexion à **{radio_name}** en cours...", ephemeral=True)
+    # Message de connexion
+    await interaction.response.send_message(
+        f"⏳ Connexion à la radio **{radio_name}**... Patiente un instant ! 🎵",
+        ephemeral=True
+    )
+
     canal_vocal = interaction.user.voice.channel
     client_vocal = interaction.guild.voice_client
 
-    # Arrêter tout ce qui joue déjà (musique ou radio)
+    # Arrêt de la lecture en cours (musique ou radio)
     if client_vocal and client_vocal.is_playing():
         client_vocal.stop()
     FILES_ATTENTE[id_guild] = deque()
     EN_COURS[id_guild] = None
     EN_COURS_TYPE[id_guild] = "radio"
 
-    if client_vocal is None or not client_vocal.is_connected():
+    # Connexion ou déplacement dans le salon vocal
+    if not client_vocal or not client_vocal.is_connected():
         client_vocal = await canal_vocal.connect()
     elif canal_vocal != client_vocal.channel:
         await client_vocal.move_to(canal_vocal)
 
+    # Configuration du flux audio avec volume
     options_ffmpeg = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         "options": "-vn"
     }
     volume = VOLUMES.get(id_guild, 0.5)
-    source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(radio_url, **options_ffmpeg), volume=volume)
+    source = discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(radio_url, **options_ffmpeg),
+        volume=volume
+    )
     client_vocal.play(source)
     EN_COURS_TYPE[id_guild] = "radio"
+
+    # Création de l'embed d'information
     embed = discord.Embed(
         title=f"📻 Radio en cours : {radio_name}",
-        description=f"Écoute **{radio_name}** en direct !",
+        description=f"🎉 Tu écoutes maintenant **{radio_name}** en direct !\n\n🔗 [Écouter la radio]({radio_url})",
         color=discord.Color.green()
     )
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/727/727245.png")
+    embed.set_footer(
+        text=f"Demandé par {interaction.user.display_name} 🎧",
+        icon_url=interaction.user.display_avatar.url
+    )
+
     await interaction.followup.send(embed=embed, ephemeral=True)
+
 
 @bot.tree.command(name="play", description="Joue une chanson ou une playlist")
 @app_commands.describe(chanson="Nom ou lien")
@@ -308,20 +433,28 @@ async def skip(interaction: discord.Interaction):
 @bot.tree.command(name="pause", description="Met la musique en pause")
 async def pause(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
+    id_guild = str(interaction.guild.id)
     if voice_client and voice_client.is_playing():
         voice_client.pause()
         await interaction.response.send_message("⏸️ Pause activée.", ephemeral=True)
+        # Met à jour les boutons après la pause
+        await refresh_controls(voice_client, id_guild, interaction.channel)
     else:
         await interaction.response.send_message("❌ Aucune chanson à mettre en pause.", ephemeral=True)
+
 
 @bot.tree.command(name="resume", description="Reprend la musique")
 async def resume(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
+    id_guild = str(interaction.guild.id)
     if voice_client and voice_client.is_paused():
         voice_client.resume()
         await interaction.response.send_message("▶️ Reprise.", ephemeral=True)
+        # Met à jour les boutons après la reprise
+        await refresh_controls(voice_client, id_guild, interaction.channel)
     else:
         await interaction.response.send_message("❌ Aucune chanson en pause.", ephemeral=True)
+
 
 @bot.tree.command(name="volume", description="Ajuste le volume de la musique (0 à 100%)")
 @app_commands.describe(pourcentage="Pourcentage du volume entre 0 et 100")
@@ -370,12 +503,6 @@ async def queue(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
-@bot.tree.command(name="serveurs", description="Liste les serveurs où le bot est présent")
-async def serveurs(interaction: discord.Interaction):
-    guilds = [guild.name for guild in bot.guilds]
-    await interaction.response.send_message(f"Le bot est sur {len(guilds)} serveurs :\n" + "\n".join(guilds), ephemeral=True)
-
 @bot.tree.command(name="nowplaying", description="Affiche le morceau en cours")
 async def nowplaying(interaction: discord.Interaction):
     id_guild = str(interaction.guild.id)
@@ -402,10 +529,21 @@ async def loop(interaction: discord.Interaction):
 @bot.tree.command(name="repeat", description="Active/désactive la répétition de la file d'attente")
 async def repeat(interaction: discord.Interaction):
     id_guild = str(interaction.guild.id)
+    voice_client = interaction.guild.voice_client
+
+    # On bascule l'état de la répétition de la file
     LOOP_QUEUE[id_guild] = not LOOP_QUEUE.get(id_guild, False)
-    LOOP_SONG[id_guild] = False
+    # On désactive la répétition de la chanson si la file est activée
+    if LOOP_QUEUE[id_guild]:
+        LOOP_SONG[id_guild] = False
+
     etat = "activée" if LOOP_QUEUE[id_guild] else "désactivée"
     await interaction.response.send_message(f"🔂 Répétition de la file {etat}.", ephemeral=True)
+
+    # Met à jour la vue des boutons
+    await refresh_controls(voice_client, id_guild, interaction.channel)
+
+
 
 @bot.tree.command(name="shuffle", description="Mélange les morceaux de la file d’attente")
 async def shuffle(interaction: discord.Interaction):
